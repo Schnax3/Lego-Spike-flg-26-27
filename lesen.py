@@ -1,61 +1,78 @@
 """
 ====================================================================
- MOTOR-AUFZEICHNUNGS-PROGRAMM fuer LEGO Education SPIKE App (3.6.1)
+ MOTOR-WIEDERGABE-PROGRAMM fuer LEGO Education SPIKE App (3.6.1)
 ====================================================================
 
-Was macht dieses Programm?
----------------------------
-Es zeichnet in einer Schleife die Motor-Positionen an den unten
-ausgewaehlten Ports auf (per fester Abtastrate) und schreibt die
-Aufzeichnung am Ende in einer EIGENEN, kompakten Kodierung aus
-(kein JSON, kein Standardformat) -> spart Speicher auf dem Hub und
-laesst sich leicht selbst wieder parsen (z.B. fuer ein Replay-Skript).
+Gegenstueck zum Aufzeichnungs-Programm. Es liest die dort ausgegebene
+Kodierung ein und faehrt die Route / Bewegungen wieder ab.
 
-WICHTIGE ANNAHME (bitte pruefen!):
-Ich gehe davon aus, dass du im "Python"-Modus der SPIKE-App
-arbeitest (nicht Word Blocks / Scratch-Ansicht), da dort das
-`spike`-Modul (PrimeHub, Motor, Button, ...) zur Verfuegung steht.
-Falls du stattdessen im MicroPython/"hub"-Modul-Modus bist
-(from hub import port, motion_sensor), sag mir Bescheid, dann
-passe ich die Hub-/Motor-Ansteuerung an - die Kern-Logik
-(Konfiguration, Sampling, Kodierung) bleibt gleich.
+Aufbau der Aufzeichnung (vom Recorder):
+    PORTS|BASE|frame1|frame2|...
+    Frame: <zeit_delta_ms>;<port><delta_grad><port><delta_grad>...
+    (alle Zahlen in Basis BASE, negative mit "-" davor)
 
 Wie benutzt man es?
 --------------------
-1. Unten im Abschnitt "KONFIGURATION" die Ports eintragen, die
-aufgezeichnet werden sollen (z.B. ["A", "B", "E"]).
-2. Programm starten. Aufzeichnung startet, sobald der Linke Button
-gedrueckt wird, und stoppt, sobald der Rechte Button gedrueckt
-wird (siehe KONFIGURATION fuer Tasten-Zuordnung).
-3. Am Ende wird die kodierte Aufzeichnung auf der Konsole
-ausgegeben (print). Du kannst sie von dort kopieren.
+1. Die Ausgabe des Recorders (die lange Zeile zwischen
+   "=== AUFZEICHNUNG ..." und "=== ENDE ===") unten bei REC_DATA
+   zwischen die Anfuehrungszeichen einfuegen.
+2. Roboter an die gleiche Startposition wie bei der Aufzeichnung stellen
+   (Greifer in gleicher Stellung!).
+3. Programm starten. Linker Button = Start, Rechter Button = Abbruch.
+
+Wie funktioniert die Wiedergabe?
+---------------------------------
+Es werden KEINE Sensoren gebraucht. Jeder Motor hat einen eingebauten
+Drehgeber (Gradzaehler). Die Wiedergabe arbeitet als einfache Regelung:
+- Aus der Aufzeichnung ergibt sich zu jedem Zeitpunkt eine Soll-Position
+  (zwischen den Frames wird linear interpoliert).
+- Die Soll-Geschwindigkeit der Aufzeichnung wird als Vorsteuerung genutzt.
+- Zusaetzlich korrigiert ein P-Regler jede Abweichung zwischen Soll- und
+  Ist-Position. So gleichen sich Akkustand, Reibung usw. selbst aus.
 """
 
-from spike import PrimeHub, Motor, Button
+from spike import PrimeHub, Motor
 from spike.control import wait_for_seconds
-import utime# fuer Zeitstempel in Millisekunden
+import utime
 
 
 # ====================================================================
-# KONFIGURATION -- hier alles einstellen, ohne den Rest anzufassen
+# KONFIGURATION
 # ====================================================================
 
-# Welche Ports sollen aufgezeichnet werden? Buchstaben von "A" bis "F".
-# Beispiel: nur zwei Motoren an A und B -> PORTS_TO_RECORD = ["A", "B"]
-PORTS_TO_RECORD = ["A", "B"]
+# Hier die Ausgabe des Aufzeichnungs-Programms einfuegen:
+REC_DATA = "A,B|36|"
 
-# Wie oft pro Sekunde soll die Position gemessen werden?
-# Hoehere Werte = genauere Aufzeichnung, aber mehr Speicherverbrauch.
-SAMPLE_RATE_HZ = 10
+# Wiedergabe-Tempo: 1.0 = wie aufgezeichnet, 0.5 = halb so schnell
+SPEED_FACTOR = 1.0
 
-# Mit welchem Button wird die Aufzeichnung gestartet / gestoppt?
-# Moegliche Werte (aus dem spike-Modul): Button.LEFT, Button.RIGHT
-START_BUTTON = Button.LEFT
-STOP_BUTTON = Button.RIGHT
+# Reglerstaerke: Prozent Motorleistung pro Grad Abweichung.
+# Zu klein = Roboter hinkt hinterher, zu gross = Ruckeln / Schwingen.
+KP = 0.8
 
-# Kodierungs-Basis fuer die eigene Ausgabe-Kodierung.
-# 36 nutzt Ziffern 0-9 und Buchstaben a-z -> sehr kompakt.
-ENCODING_BASE = 36
+# Motorleistung (Prozent) bei der der Motor etwa diese Grad pro Sekunde
+# schafft. Medium-Motor ca. 1000-1100, Large-Motor ca. 900-1000.
+# Bei Bedarf feintunen (Roboter zu langsam -> Wert verkleinern).
+DEG_PER_SEC_AT_100 = 1000
+
+# Maximale Motorleistung pro Port (Prozent). Ports die hier nicht
+# stehen, nutzen DEFAULT_MAX_SPEED. Greifer bewusst sanfter, damit sie
+# bei Widerstand nicht zu fest druecken.
+DEFAULT_MAX_SPEED = 100
+MAX_SPEED = {"A": 100, "B": 100, "E": 50, "F": 50}
+
+# Was der Motor am Ende / bei Abbruch tun soll: "brake", "hold" oder "coast".
+# Greifer sollen halten, Fahrmotoren bremsen.
+DEFAULT_STOP_ACTION = "brake"
+STOP_ACTION = {"A": "brake", "B": "brake", "E": "hold", "F": "hold"}
+
+# Regelintervall in Millisekunden
+CONTROL_INTERVAL_MS = 20
+
+# Nach dem letzten Frame noch bis zu so lange nachregeln, bis alle
+# Motoren nahe genug am Ziel sind (Millisekunden / Grad Toleranz).
+SETTLE_TIMEOUT_MS = 1500
+SETTLE_TOLERANCE_DEG = 3
 
 
 # ====================================================================
@@ -64,131 +81,195 @@ ENCODING_BASE = 36
 
 hub = PrimeHub()
 
-# Motor-Objekte automatisch anhand von PORTS_TO_RECORD erzeugen.
-# So musst du beim Aendern der Ports nur die Liste oben anpassen.
-motors = {}
-for port_letter in PORTS_TO_RECORD:
-    motors[port_letter] = Motor(port_letter)
+PORT_LETTERS = "ABCDEF"
 
 
-def encode_number(n):
-    """
-    Wandelt eine (moeglicherweise negative) Ganzzahl in eine kompakte
-    Base-36-Zeichenkette um. Eigene, einfache Kodierung:
-    - "-" Praefix fuer negative Zahlen
-    - Ziffern 0-9 und Buchstaben a-z fuer die Basis-36-Stellen
-    """
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-    if n == 0:
-        return "0"
-
-    negative = n < 0
-    n = abs(n)
-    result = ""
-    while n > 0:
-        n, remainder = divmod(n, ENCODING_BASE)
-        result = digits[remainder] + result
-
+def decode_number(text, base):
+    """Gegenstueck zu encode_number des Recorders (Basis-N, "-" = negativ)."""
+    if text == "" or text == "0":
+        return 0
+    negative = text[0] == "-"
     if negative:
-        result = "-" + result
-    return result
+        text = text[1:]
+    value = int(text, base)
+    if negative:
+        value = -value
+    return value
 
 
-def encode_frame(timestamp_ms, positions, previous_positions):
+def parse_recording(data):
     """
-    Kodiert EINEN aufgezeichneten Zeitpunkt (Frame) als kompakten
-    Text-Abschnitt.
-
-    Eigene Kodierung, Aufbau pro Frame:
-        <zeit_delta_in_ms>;<port><delta_position><port><delta_position>...
-
-    - zeit_delta_in_ms: Zeit seit dem letzten Frame (statt absoluter
-    Zeitstempel), damit die Zahlen klein und kurz bleiben.
-    - delta_position: Veraenderung der Motor-Position seit dem letzten
-    Frame (statt absoluter Position), aus demselben Grund.
-
-    Beispiel-Frame: "a;A5B-2"
-    -> a (=10ms base36) seit letztem Frame vergangen,
-        Motor A hat sich um +5 Grad, Motor B um -2 Grad bewegt.
+    Zerlegt die Aufzeichnung in:
+        ports   - Liste der Port-Buchstaben
+        times   - Liste kumulierter Zeitpunkte in ms (beginnt bei 0)
+        targets - Dict: Port -> Liste kumulierter Positionen relativ zum
+                  Start (gleich lang wie times, beginnt bei 0)
     """
-    time_delta = timestamp_ms - previous_positions["_time"]
-    parts = [encode_number(time_delta)]
+    parts = data.strip().split("|")
+    if len(parts) < 3:
+        raise ValueError("REC_DATA ist leer oder unvollstaendig")
 
-    port_codes = []
-    for port_letter in PORTS_TO_RECORD:
-        current_pos = positions[port_letter]
-        previous_pos = previous_positions[port_letter]
-        delta = current_pos - previous_pos
-        port_codes.append(port_letter + encode_number(delta))
+    ports = parts[0].split(",")
+    base = int(parts[1])
 
-    return parts[0] + ";" + "".join(port_codes)
+    times = [0]
+    targets = {}
+    for p in ports:
+        targets[p] = [0]
+
+    for frame in parts[2:]:
+        if frame == "":
+            continue
+        time_text, rest = frame.split(";")
+        dt = decode_number(time_text, base)
+
+        # Port-Abschnitte lesen: Grossbuchstabe A-F beginnt einen neuen
+        # Abschnitt, die Zahl besteht aus Ziffern/Kleinbuchstaben/"-".
+        deltas = {}
+        i = 0
+        while i < len(rest):
+            port_letter = rest[i]
+            j = i + 1
+            while j < len(rest) and rest[j] not in PORT_LETTERS:
+                j += 1
+            deltas[port_letter] = decode_number(rest[i + 1:j], base)
+            i = j
+
+        times.append(times[-1] + dt)
+        for p in ports:
+            targets[p].append(targets[p][-1] + deltas.get(p, 0))
+
+    return ports, times, targets
 
 
-def record():
-    """
-    Zeichnet Motor-Positionen auf, bis STOP_BUTTON gedrueckt wird.
-    Gibt eine Liste von kodierten Frame-Strings zurueck.
-    """
-    hub.light_matrix.show_image("SQUARE")# zeigt "bereit" an
+def clamp(value, limit):
+    if value > limit:
+        return limit
+    if value < -limit:
+        return -limit
+    return value
 
-    print("Warte auf Start-Button...")
-    while not hub.left_button.was_pressed() and START_BUTTON == Button.LEFT:
-        pass
-    # Hinweis / ANNAHME: falls START_BUTTON auf Button.RIGHT konfiguriert
-    # ist, muss hier hub.right_button.was_pressed() geprueft werden.
-    # Ich habe das oben vereinfacht auf LEFT gehalten, da das dein
-    # Standard-Fall ist -> sag mir Bescheid, wenn du RIGHT als Start
-    # brauchst, dann baue ich das sauber generisch fuer beide Buttons.
 
-    hub.light_matrix.show_image("HAPPY")# zeigt "Aufzeichnung laeuft" an
-    print("Aufzeichnung gestartet.")
+def stop_all(motors):
+    for p in motors:
+        motors[p].stop()
 
-    encoded_frames = []
-    start_time = utime.ticks_ms()
 
-    # "vorherige" Werte initialisieren: Zeit = 0, jede Motor-Position = 0
-    previous = {"_time": 0}
-    for port_letter in PORTS_TO_RECORD:
-        previous[port_letter] = motors[port_letter].get_degrees_counted()
+def replay():
+    ports, times, targets = parse_recording(REC_DATA)
+    if len(times) < 2:
+        print("Keine Frames in REC_DATA gefunden.")
+        return
 
-    sample_interval_ms = int(1000 / SAMPLE_RATE_HZ)
+    motors = {}
+    start_pos = {}
+    for p in ports:
+        m = Motor(p)
+        m.set_stall_detection(False)
+        m.set_stop_action(STOP_ACTION.get(p, DEFAULT_STOP_ACTION))
+        motors[p] = m
 
-    while not hub.right_button.was_pressed():
-        now = utime.ticks_diff(utime.ticks_ms(), start_time)
-
-        # aktuelle Positionen aller konfigurierten Motoren auslesen
-        current_positions = {}
-        for port_letter in PORTS_TO_RECORD:
-            current_positions[port_letter] = motors[port_letter].get_degrees_counted()
-
-        frame = encode_frame(now, current_positions, previous)
-        encoded_frames.append(frame)
-
-        # aktuelle Werte werden zu den "vorherigen" fuer den naechsten Durchlauf
-        previous["_time"] = now
-        for port_letter in PORTS_TO_RECORD:
-            previous[port_letter] = current_positions[port_letter]
-
-        wait_for_seconds(sample_interval_ms / 1000)
+    print("Ports:", ports, "Frames:", len(times) - 1,
+          "Dauer (s):", times[-1] / 1000)
 
     hub.light_matrix.show_image("SQUARE")
-    print("Aufzeichnung gestoppt.")
-    return encoded_frames
+    print("Warte auf linken Button (Start)...")
+    while not hub.left_button.was_pressed():
+        wait_for_seconds(0.05)
+
+    hub.light_matrix.show_image("ARROW_E")
+    print("Wiedergabe gestartet.")
+
+    # Startposition merken: alle Soll-Positionen sind relativ dazu
+    for p in ports:
+        start_pos[p] = motors[p].get_degrees_counted()
+
+    # Rechten Button vorher leeren, damit alte Klicks nicht sofort abbrechen
+    hub.right_button.was_pressed()
+
+    total_ms = times[-1]
+    start_time = utime.ticks_ms()
+    segment = 0
+    aborted = False
+    finished_at = None
+
+    while True:
+        if hub.right_button.was_pressed():
+            aborted = True
+            break
+
+        elapsed = utime.ticks_diff(utime.ticks_ms(), start_time)
+        t = elapsed * SPEED_FACTOR  # Position in der Aufzeichnungs-Zeit
+
+        in_recording = t < total_ms
+
+        if in_recording:
+            # passendes Segment [times[segment], times[segment+1]] suchen
+            while segment < len(times) - 2 and t >= times[segment + 1]:
+                segment += 1
+            t0 = times[segment]
+            t1 = times[segment + 1]
+            span = t1 - t0
+            if span > 0:
+                frac = (t - t0) / span
+            else:
+                frac = 1.0
+        else:
+            segment = len(times) - 2
+            t0 = times[segment]
+            t1 = times[segment + 1]
+            span = t1 - t0
+            frac = 1.0
+
+        all_close = True
+        for p in ports:
+            p0 = targets[p][segment]
+            p1 = targets[p][segment + 1]
+            target = start_pos[p] + p0 + (p1 - p0) * frac
+            actual = motors[p].get_degrees_counted()
+            error = target - actual
+
+            if in_recording and span > 0:
+                # Vorsteuerung: aufgezeichnete Geschwindigkeit (Grad/s)
+                feed_deg_s = (p1 - p0) * 1000.0 / span * SPEED_FACTOR
+                feed = feed_deg_s / DEG_PER_SEC_AT_100 * 100.0
+            else:
+                feed = 0
+
+            power = feed + KP * error
+            limit = MAX_SPEED.get(p, DEFAULT_MAX_SPEED)
+            power = clamp(power, limit)
+
+            if abs(error) > SETTLE_TOLERANCE_DEG:
+                all_close = False
+
+            motors[p].start(int(power))
+
+        if not in_recording:
+            if finished_at is None:
+                finished_at = utime.ticks_ms()
+            waited = utime.ticks_diff(utime.ticks_ms(), finished_at)
+            if all_close or waited > SETTLE_TIMEOUT_MS:
+                break
+
+        wait_for_seconds(CONTROL_INTERVAL_MS / 1000)
+
+    stop_all(motors)
+
+    if aborted:
+        hub.light_matrix.show_image("NO")
+        print("Wiedergabe abgebrochen.")
+    else:
+        hub.light_matrix.show_image("YES")
+        print("Wiedergabe fertig.")
+        for p in ports:
+            ziel = start_pos[p] + targets[p][-1]
+            ist = motors[p].get_degrees_counted()
+            print("Port", p, "Ziel:", ziel, "Ist:", ist, "Abweichung:", ziel - ist)
 
 
 def main():
-    frames = record()
-
-    # Header enthaelt die Konfiguration, damit die Aufzeichnung beim
-    # spaeteren Einlesen (Replay) selbsterklaerend ist:
-    # Format: PORTS|BASE|frame1|frame2|...
-    header = ",".join(PORTS_TO_RECORD) + "|" + str(ENCODING_BASE)
-    output = header + "|" + "|".join(frames)
-
-    print("=== AUFZEICHNUNG (eigene Kodierung) ===")
-    print(output)
-    print("=== ENDE ===")
-    print("Anzahl Frames:", len(frames))
+    replay()
 
 
 main()
